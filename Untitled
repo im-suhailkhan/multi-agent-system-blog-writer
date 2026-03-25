@@ -1,0 +1,337 @@
+"""
+Multi-Agent Collaboration with LangGraph
+=========================================
+A hierarchical multi-agent system with:
+  - Research Team  : search agent + web scraper agent
+  - Writing Team   : doc writer + note taker + chart generator
+  - Top-level Supervisor that routes between the two teams
+
+Requirements:
+    pip install langgraph langchain_community langchain-tavily \
+                langchain_experimental langchain_openai
+
+Usage:
+    Set OPENAI_API_KEY and TAVILY_API_KEY as environment variables
+    (or via a .env file), then run:
+
+        python multi_agent_collab.py
+"""
+
+import os
+from pathlib import Path
+from typing import Annotated, Dict, List, Literal, Optional
+
+from langchain.agents import create_react_agent          # updated import (no deprecation)
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langchain_tavily import TavilySearch
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.types import Command
+from typing_extensions import TypedDict
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Directory where agents will read/write documents.
+# Change this to any writable folder on your machine.
+DOCS_DIR = Path(os.getenv("AGENT_DOCS_DIR", "./agent_docs"))
+DOCS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _doc_path(file_name: str) -> Path:
+    """Resolve a document file name to an absolute path inside DOCS_DIR."""
+    return DOCS_DIR / file_name
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+@tool
+def scrape_webpages(urls: List[str]) -> str:
+    """Scrape the provided web pages and return their text content."""
+    loader = WebBaseLoader(urls)
+    docs = loader.load()
+    return "\n\n".join(
+        f'<Document name="{doc.metadata.get("title", "")}">\n{doc.page_content}\n</Document>'
+        for doc in docs
+    )
+
+
+@tool
+def create_outline(
+    points: Annotated[List[str], "List of main points or sections"],
+    file_name: Annotated[str, "File name to save the outline (no path needed)"],
+) -> Annotated[str, "Path of the saved outline file"]:
+    """Create and save a numbered outline."""
+    path = _doc_path(file_name)
+    with open(path, "w") as f:
+        for i, point in enumerate(points, 1):
+            f.write(f"{i}. {point}\n")
+    return f"Outline saved to {path}"
+
+
+@tool
+def read_document(
+    file_name: Annotated[str, "File name to read (no path needed)"],
+    start: Annotated[Optional[int], "The start line (0-indexed). Default is 0"] = None,
+    end: Annotated[Optional[int], "The end line (exclusive). Default is None"] = None,
+) -> str:
+    """Read lines from a document."""
+    path = _doc_path(file_name)
+    with open(path, "r") as f:
+        lines = f.readlines()
+    start = start or 0
+    return "".join(lines[start:end])
+
+
+@tool
+def write_document(
+    content: Annotated[str, "Text content to write"],
+    file_name: Annotated[str, "File name to save (no path needed)"],
+) -> str:
+    """Create and save a text document."""
+    path = _doc_path(file_name)
+    with open(path, "w") as f:
+        f.write(content)
+    return f"Document saved to {path}"
+
+
+@tool
+def edit_document(
+    file_name: Annotated[str, "File name to edit (no path needed)"],
+    insert: Annotated[
+        Dict[int, str],
+        "Dict where key = 1-based line number and value = text to insert at that line",
+    ],
+) -> str:
+    """Edit a document by inserting text at specified (1-based) line numbers."""
+    path = _doc_path(file_name)
+    with open(path, "r") as f:
+        lines = f.readlines()
+
+    for line_number, text in sorted(insert.items()):
+        if 1 <= line_number <= len(lines) + 1:
+            lines.insert(line_number - 1, text + "\n")
+        else:
+            return f"Error: line number {line_number} is out of range"
+
+    with open(path, "w") as f:
+        f.writelines(lines)
+
+    return f"Document edited and saved to {path}"
+
+
+@tool
+def python_repl_tool(
+    code: Annotated[str, "Python code to execute"],
+) -> str:
+    """Execute Python code and return stdout.  Use print() to see output."""
+    import io
+    import sys
+
+    old_stdout = sys.stdout
+    sys.stdout = buffer = io.StringIO()
+    try:
+        exec(code, {})  # noqa: S102
+        output = buffer.getvalue()
+    except Exception as e:
+        output = f"Error: {repr(e)}"
+    finally:
+        sys.stdout = old_stdout
+
+    return f"Successfully executed:\n```python\n{code}\n```\nStdout:\n{output}"
+
+
+# ---------------------------------------------------------------------------
+# Supervisor factory
+# ---------------------------------------------------------------------------
+
+class State(MessagesState):
+    next: str
+
+
+def make_supervisor_node(llm: BaseChatModel, members: List[str]):
+    """Return a supervisor node that routes between *members* (or FINISH → END)."""
+    options = ["FINISH"] + members
+    system_prompt = (
+        "You are a supervisor tasked with managing a conversation between the"
+        f" following workers: {members}. Given the following user request,"
+        " respond with the worker to act next. Each worker will perform a"
+        " task and respond with their results and status. When finished,"
+        " respond with FINISH."
+    )
+
+    class Router(TypedDict):
+        next: Literal[*options]  # type: ignore[valid-type]
+
+    def supervisor_node(state: State) -> Command[Literal[*members, "__end__"]]:  # type: ignore[valid-type]
+        messages = [{"role": "system", "content": system_prompt}] + state["messages"]
+        response = llm.with_structured_output(Router).invoke(messages)
+        goto = response["next"]
+        if goto == "FINISH":
+            goto = END
+        return Command(goto=goto, update={"next": goto})
+
+    return supervisor_node
+
+
+# ---------------------------------------------------------------------------
+# LLM & shared tools
+# ---------------------------------------------------------------------------
+
+llm = ChatOpenAI(model="gpt-4o")
+tavily_tool = TavilySearch(max_results=3)
+
+# ---------------------------------------------------------------------------
+# Research Team
+# ---------------------------------------------------------------------------
+
+search_agent = create_react_agent(llm, tools=[tavily_tool])
+
+
+def search_node(state: State) -> Command[Literal["supervisor"]]:
+    result = search_agent.invoke(state)
+    return Command(
+        update={"messages": [HumanMessage(content=result["messages"][-1].content, name="search")]},
+        goto="supervisor",
+    )
+
+
+web_scrapper_agent = create_react_agent(llm, tools=[scrape_webpages])
+
+
+def web_scrapper_node(state: State) -> Command[Literal["supervisor"]]:
+    result = web_scrapper_agent.invoke(state)
+    return Command(
+        update={"messages": [HumanMessage(content=result["messages"][-1].content, name="web_scrapper")]},
+        goto="supervisor",
+    )
+
+
+research_supervisor_node = make_supervisor_node(llm, ["search", "web_scrapper"])
+
+research_builder = StateGraph(State)
+research_builder.add_node("supervisor", research_supervisor_node)
+research_builder.add_node("search", search_node)
+research_builder.add_node("web_scrapper", web_scrapper_node)
+research_builder.add_edge(START, "supervisor")
+research_graph = research_builder.compile()
+
+# ---------------------------------------------------------------------------
+# Writing Team
+# ---------------------------------------------------------------------------
+
+doc_writer_agent = create_react_agent(
+    llm,
+    tools=[write_document, edit_document, read_document],
+    prompt=(
+        "You can read, write and edit documents based on note taker's outlines. "
+        "Don't ask follow up questions."
+    ),
+)
+
+
+def doc_writing_node(state: State) -> Command[Literal["supervisor"]]:
+    result = doc_writer_agent.invoke(state)
+    return Command(
+        update={"messages": [HumanMessage(content=result["messages"][-1].content, name="doc_writer")]},
+        goto="supervisor",
+    )
+
+
+note_taking_agent = create_react_agent(
+    llm,
+    tools=[create_outline, read_document],
+    prompt=(
+        "You can read documents and create outlines for the document writer. "
+        "Don't ask follow up questions."
+    ),
+)
+
+
+def note_taking_node(state: State) -> Command[Literal["supervisor"]]:
+    result = note_taking_agent.invoke(state)
+    return Command(
+        update={"messages": [HumanMessage(content=result["messages"][-1].content, name="note_taker")]},
+        goto="supervisor",
+    )
+
+
+chart_generating_agent = create_react_agent(llm, tools=[read_document, python_repl_tool])
+
+
+def chart_generating_node(state: State) -> Command[Literal["supervisor"]]:
+    result = chart_generating_agent.invoke(state)
+    return Command(
+        update={"messages": [HumanMessage(content=result["messages"][-1].content, name="chart_generator")]},
+        goto="supervisor",
+    )
+
+
+doc_writing_supervisor_node = make_supervisor_node(
+    llm, ["doc_writer", "note_taker", "chart_generator"]
+)
+
+writing_builder = StateGraph(State)
+writing_builder.add_node("supervisor", doc_writing_supervisor_node)
+writing_builder.add_node("doc_writer", doc_writing_node)
+writing_builder.add_node("note_taker", note_taking_node)
+writing_builder.add_node("chart_generator", chart_generating_node)
+writing_builder.add_edge(START, "supervisor")
+writing_graph = writing_builder.compile()
+
+# ---------------------------------------------------------------------------
+# Top-level (hierarchical) graph
+# ---------------------------------------------------------------------------
+
+teams_supervisor_node = make_supervisor_node(llm, ["research_team", "writing_team"])
+
+
+def call_research_team(state: State) -> Command[Literal["supervisor"]]:
+    response = research_graph.invoke({"messages": state["messages"][-1]})
+    return Command(
+        update={"messages": [HumanMessage(content=response["messages"][-1].content, name="research_team")]},
+        goto="supervisor",
+    )
+
+
+def call_writing_team(state: State) -> Command[Literal["supervisor"]]:
+    response = writing_graph.invoke({"messages": state["messages"][-1]})
+    return Command(
+        update={"messages": [HumanMessage(content=response["messages"][-1].content, name="writing_team")]},
+        goto="supervisor",
+    )
+
+
+super_builder = StateGraph(State)
+super_builder.add_node("supervisor", teams_supervisor_node)
+super_builder.add_node("research_team", call_research_team)
+super_builder.add_node("writing_team", call_writing_team)
+super_builder.add_edge(START, "supervisor")
+super_graph = super_builder.compile()
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    query = (
+        "Research why the gold price has been increasing in 2025. "
+        "Compile a report with the reasons. Text and numbers only – no charts."
+    )
+
+    print("=" * 60)
+    print("Running super_graph …")
+    print("=" * 60)
+
+    for step in super_graph.stream(
+        {"messages": [("user", query)]},
+        {"recursion_limit": 100},
+    ):
+        print(step)
+        print("----")
