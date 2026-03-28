@@ -34,7 +34,10 @@ from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
-from langchain_groq import ChatGroq
+# from langchain_groq import ChatGroq
+# from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
+import time
 from langchain_tavily import TavilySearch
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.types import Command
@@ -162,6 +165,19 @@ def python_repl_tool(
 class State(MessagesState):
     next: str
 
+class RateLimitedChatOpenAI(ChatOpenAI):
+    def invoke(self, *args, **kwargs):
+        for attempt in range(5):
+            try:
+                return super().invoke(*args, **kwargs)
+            except Exception as e:
+                if "429" in str(e):
+                    wait = 2 ** attempt  # 1s, 2s, 4s, 8s, 16s
+                    print(f"Rate limited, retrying in {wait}s...")
+                    time.sleep(wait)
+                else:
+                    raise
+        raise Exception("Max retries exceeded")
 
 def make_supervisor_node(llm: BaseChatModel, members: List[str]):
     """Return a supervisor node that routes between *members* (or FINISH → END)."""
@@ -195,7 +211,20 @@ def make_supervisor_node(llm: BaseChatModel, members: List[str]):
 # llama-3.3-70b-versatile has excellent tool-calling support on Groq.
 # Other good options: "llama3-groq-70b-8192-tool-use-preview", "mixtral-8x7b-32768"
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-llm = ChatGroq(model=GROQ_MODEL, temperature=0)
+# llm = ChatGroq(model=GROQ_MODEL, temperature=0)
+# llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
+# llm = ChatOpenAI(
+#     model="meta-llama/llama-3.3-70b-instruct:free",  # free tier model
+#     openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+#     openai_api_base="https://openrouter.ai/api/v1",
+#     temperature=0,
+# )
+llm = RateLimitedChatOpenAI(
+    model="openrouter/auto",
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1",
+    temperature=0,
+)
 tavily_tool = TavilySearch(max_results=3)
 
 # ---------------------------------------------------------------------------
@@ -203,7 +232,6 @@ tavily_tool = TavilySearch(max_results=3)
 # ---------------------------------------------------------------------------
 
 search_agent = create_react_agent(llm, tools=[tavily_tool])
-
 
 def search_node(state: State) -> Command[Literal["supervisor"]]:
     result = search_agent.invoke(state)
@@ -304,7 +332,9 @@ teams_supervisor_node = make_supervisor_node(llm, ["research_team", "writing_tea
 
 
 def call_research_team(state: State) -> Command[Literal["supervisor"]]:
-    response = research_graph.invoke({"messages": state["messages"][-1]})
+    response = research_graph.invoke({"messages": state["messages"][-1]},
+    {"recursion_limit": 100} 
+    )
     return Command(
         update={"messages": [HumanMessage(content=response["messages"][-1].content, name="research_team")]},
         goto="supervisor",
@@ -312,7 +342,9 @@ def call_research_team(state: State) -> Command[Literal["supervisor"]]:
 
 
 def call_writing_team(state: State) -> Command[Literal["supervisor"]]:
-    response = writing_graph.invoke({"messages": state["messages"][-1]})
+    response = writing_graph.invoke({"messages": state["messages"][-1]},
+    {"recursion_limit": 100}
+    )
     return Command(
         update={"messages": [HumanMessage(content=response["messages"][-1].content, name="writing_team")]},
         goto="supervisor",
